@@ -1,9 +1,19 @@
 const MASTER_RAMP_SECONDS = 0.05;
 const REGION_RAMP_SECONDS = 0.08;
 const REVERB_SECONDS = 6.2;
+const REVERB_SECONDS_LITE = 2.5;
 const REVERB_DECAY = 4.1;
 const REVERB_WET_GAIN = 0.52;
 const REVERB_DRY_GAIN = 0.82;
+
+// Mobile-friendly mix scheduling.
+const MIX_THROTTLE_MS = 50; // ~20 Hz instead of per animation frame
+const MIX_GATE = 0.001; // skip gain ramps smaller than this
+
+// Dynamic-voice thresholds (only audible regions get a live source).
+const VOICE_ON = 0.012;
+const VOICE_OFF = 0.0025;
+const VOICE_FADE_SECONDS = 0.35;
 
 export class DroneAudioEngine {
   constructor(regions, zoneState) {
@@ -11,18 +21,31 @@ export class DroneAudioEngine {
     this.zoneState = zoneState;
     this.context = null;
     this.regionGains = [];
-    this.sources = [];
+    this.voices = regions.map(() => ({ source: null, stopAt: 0 }));
+    this.buffers = [];
     this.master = null;
     this.eq = {};
     this.reverb = {};
     this.started = false;
+    this.preloaded = false;
     this.usingFallback = false;
+    this.liteMode = detectLiteMode();
+    this.ready = null;
+    this._loaded = 0;
+    this._lastMixAt = 0;
+    this._lastTargets = new Float32Array(regions.length).fill(-1);
+    this.streamDest = null;
+    this.mediaEl = null;
+    this.usingStreamSink = false;
+    this._fadeTimer = null;
   }
 
-  async start(settings, onProgress = () => {}) {
-    if (this.started) {
-      await this.resume();
-      return;
+  // Fetch + decode every buffer ahead of time, without a user gesture. The
+  // context is created suspended (no audio output yet); decoding works fine on a
+  // suspended context, so a later start() can begin playback instantly.
+  async preload(settings, onProgress = () => {}) {
+    if (this.preloaded || this.context) {
+      return this.ready;
     }
 
     const AudioContextClass = window.AudioContext || window.webkitAudioContext;
@@ -30,36 +53,87 @@ export class DroneAudioEngine {
       throw new Error("Web Audio API is not available in this browser.");
     }
 
-    this.context = new AudioContextClass();
-    await this.resume();
+    this.context = new AudioContextClass({ latencyHint: "playback" });
     this.createBus(settings);
 
-    let loaded = 0;
-    const buffers = await Promise.all(
-      this.regions.map(async (region) => {
+    this._loaded = 0;
+    this.ready = Promise.all(
+      this.regions.map(async (region, index) => {
         const buffer = await this.loadBuffer(region);
-        loaded += 1;
-        onProgress(loaded, this.regions.length, this.usingFallback);
+        this.buffers[index] = buffer;
+        this._loaded += 1;
+        onProgress(this._loaded, this.regions.length, this.usingFallback);
         return buffer;
       })
     );
+    this.preloaded = true;
+    return this.ready;
+  }
 
-    const startAt = this.context.currentTime + 0.06;
-    buffers.forEach((buffer, index) => {
-      const source = this.context.createBufferSource();
-      const gain = this.context.createGain();
-      source.buffer = buffer;
-      source.loop = true;
-      gain.gain.value = 0;
-      source.connect(gain);
-      gain.connect(this.eq.low);
-      source.start(startAt);
-      this.sources[index] = source;
-      this.regionGains[index] = gain;
-    });
+  async start(settings, onProgress = () => {}) {
+    if (this.started) {
+      await this.resumePlayback();
+      return;
+    }
+
+    if (!this.preloaded) {
+      await this.preload(settings, onProgress);
+    }
+    await this.ready;
+
+    await this.resume();
+    this.buildVoices();
+    await this.setupOutputSink();
 
     this.started = true;
     this.updateSettings(settings);
+  }
+
+  // Persistent per-region gain nodes. The buffer sources themselves are created
+  // lazily in updateMix() so only audible regions ever run.
+  buildVoices() {
+    const ctx = this.context;
+    for (let index = 0; index < this.regions.length; index += 1) {
+      const gain = ctx.createGain();
+      gain.gain.value = 0;
+      gain.connect(this.eq.low);
+      this.regionGains[index] = gain;
+      this.voices[index] = { source: null, stopAt: 0 };
+      this._lastTargets[index] = -1;
+    }
+  }
+
+  // Route master through a MediaStream + hidden <audio> element so mobile
+  // browsers surface OS media controls and keep playing in the background. Falls
+  // back to the direct destination if that path is unavailable (e.g. iOS quirks).
+  async setupOutputSink() {
+    const ctx = this.context;
+    try {
+      if (typeof ctx.createMediaStreamDestination !== "function") {
+        throw new Error("MediaStream destination unsupported");
+      }
+      this.mediaEl = document.getElementById("mediaSink");
+      if (!this.mediaEl) {
+        throw new Error("Media element missing");
+      }
+      this.streamDest = ctx.createMediaStreamDestination();
+      this.master.connect(this.streamDest);
+      this.mediaEl.srcObject = this.streamDest.stream;
+      this.mediaEl.loop = true;
+      await this.mediaEl.play();
+      this.usingStreamSink = true;
+    } catch (error) {
+      this.usingStreamSink = false;
+      if (this.streamDest) {
+        try {
+          this.master.disconnect(this.streamDest);
+        } catch (disconnectError) {
+          /* ignore */
+        }
+        this.streamDest = null;
+      }
+      this.master.connect(ctx.destination);
+    }
   }
 
   async resume() {
@@ -70,6 +144,60 @@ export class DroneAudioEngine {
           window.setTimeout(resolve, 800);
         })
       ]);
+    }
+  }
+
+  async resumePlayback() {
+    await this.resume();
+    if (this.usingStreamSink && this.mediaEl) {
+      try {
+        await this.mediaEl.play();
+      } catch (error) {
+        /* ignore */
+      }
+    }
+  }
+
+  async suspend() {
+    if (this.context && this.context.state === "running") {
+      await this.context.suspend().catch(() => undefined);
+    }
+    if (this.mediaEl) {
+      try {
+        this.mediaEl.pause();
+      } catch (error) {
+        /* ignore */
+      }
+    }
+  }
+
+  // Gently fade the master out over `seconds`, then suspend. Master gain is
+  // restored afterwards (while silent) so a later resume isn't muted.
+  fadeOutAndPause(seconds = 12) {
+    if (!this.context || !this.master) {
+      return;
+    }
+    const now = this.context.currentTime;
+    const volume = this.master.gain.value;
+    this.master.gain.cancelScheduledValues(now);
+    this.master.gain.setValueAtTime(volume, now);
+    this.master.gain.linearRampToValueAtTime(0.0001, now + seconds);
+    window.clearTimeout(this._fadeTimer);
+    this._fadeTimer = window.setTimeout(async () => {
+      await this.suspend();
+      if (this.master) {
+        this.master.gain.value = volume;
+      }
+    }, seconds * 1000 + 60);
+  }
+
+  cancelFade() {
+    if (this._fadeTimer) {
+      window.clearTimeout(this._fadeTimer);
+      this._fadeTimer = null;
+    }
+    if (this.context && this.master) {
+      this.master.gain.cancelScheduledValues(this.context.currentTime);
     }
   }
 
@@ -93,7 +221,12 @@ export class DroneAudioEngine {
     this.eq.high.frequency.value = 4000;
     this.reverb.dry.gain.value = REVERB_DRY_GAIN;
     this.reverb.preDelay.delayTime.value = 0.035;
-    this.reverb.convolver.buffer = createReverbImpulse(ctx, REVERB_SECONDS, REVERB_DECAY);
+
+    // Lighter reverb on phones: a shorter, mono impulse is far cheaper to
+    // convolve. Desktop keeps the original full stereo tail.
+    const reverbSeconds = this.liteMode ? REVERB_SECONDS_LITE : REVERB_SECONDS;
+    const reverbChannels = this.liteMode ? 1 : 2;
+    this.reverb.convolver.buffer = createReverbImpulse(ctx, reverbSeconds, REVERB_DECAY, reverbChannels);
     this.reverb.wet.gain.value = REVERB_WET_GAIN;
 
     this.eq.low.connect(this.eq.mid);
@@ -104,7 +237,7 @@ export class DroneAudioEngine {
     this.reverb.convolver.connect(this.reverb.wet);
     this.reverb.dry.connect(this.master);
     this.reverb.wet.connect(this.master);
-    this.master.connect(ctx.destination);
+    // The master sink (MediaStream or destination) is chosen by setupOutputSink().
     this.updateSettings(settings);
   }
 
@@ -125,12 +258,77 @@ export class DroneAudioEngine {
       return;
     }
 
-    const now = this.context.currentTime;
-    for (let index = 0; index < this.regionGains.length; index += 1) {
+    const wall = typeof performance !== "undefined" ? performance.now() : Date.now();
+    if (wall - this._lastMixAt < MIX_THROTTLE_MS) {
+      return;
+    }
+    this._lastMixAt = wall;
+
+    const ctx = this.context;
+    const now = ctx.currentTime;
+    for (let index = 0; index < this.regions.length; index += 1) {
       const weight = Math.max(0, Math.min(1, this.zoneState[index].weight));
       const gain = Math.sin(weight * Math.PI * 0.5);
-      this.regionGains[index].gain.setTargetAtTime(gain, now, REGION_RAMP_SECONDS);
+      const voice = this.voices[index];
+      let target;
+
+      if (gain > VOICE_ON) {
+        if (!voice.source) {
+          this.spawnVoice(index, now);
+        } else if (voice.stopAt) {
+          voice.stopAt = 0; // becoming audible again before the fade finished
+        }
+        target = gain;
+      } else if (gain < VOICE_OFF) {
+        if (voice.source && !voice.stopAt) {
+          voice.stopAt = now + VOICE_FADE_SECONDS;
+        }
+        target = 0;
+      } else {
+        target = voice.source ? (voice.stopAt ? 0 : gain) : 0;
+      }
+
+      if (Math.abs(target - this._lastTargets[index]) >= MIX_GATE) {
+        this._lastTargets[index] = target;
+        this.regionGains[index].gain.setTargetAtTime(target, now, REGION_RAMP_SECONDS);
+      }
+
+      if (voice.source && voice.stopAt && now >= voice.stopAt) {
+        try {
+          voice.source.stop();
+        } catch (error) {
+          /* ignore */
+        }
+        try {
+          voice.source.disconnect();
+        } catch (error) {
+          /* ignore */
+        }
+        voice.source = null;
+        voice.stopAt = 0;
+      }
     }
+  }
+
+  spawnVoice(index, now) {
+    const buffer = this.buffers[index];
+    if (!buffer) {
+      return;
+    }
+    const source = this.context.createBufferSource();
+    source.buffer = buffer;
+    source.loop = true;
+    source.connect(this.regionGains[index]);
+    const offset = buffer.duration > 0 ? Math.random() * buffer.duration : 0;
+    source.start(now, offset);
+
+    const gainParam = this.regionGains[index].gain;
+    gainParam.cancelScheduledValues(now);
+    gainParam.setValueAtTime(0, now); // ramp up from silence to avoid clicks
+
+    this.voices[index].source = source;
+    this.voices[index].stopAt = 0;
+    this._lastTargets[index] = -1;
   }
 
   async loadBuffer(region) {
@@ -185,14 +383,25 @@ export class DroneAudioEngine {
   }
 }
 
+function detectLiteMode() {
+  try {
+    const coarse = typeof window.matchMedia === "function" && window.matchMedia("(pointer: coarse)").matches;
+    const lowCores = (navigator.hardwareConcurrency || 8) <= 4;
+    const mobileUA = /Android|iPhone|iPad|iPod|Mobile/i.test(navigator.userAgent || "");
+    return Boolean((coarse && lowCores) || mobileUA);
+  } catch (error) {
+    return false;
+  }
+}
+
 function quantizedFrequencyFromMidi(midi, duration) {
   const frequency = 440 * 2 ** ((midi - 69) / 12);
   return Math.max(1, Math.round(frequency * duration) / duration);
 }
 
-function createReverbImpulse(ctx, seconds, decay) {
+function createReverbImpulse(ctx, seconds, decay, channels = 2) {
   const length = Math.floor(ctx.sampleRate * seconds);
-  const impulse = ctx.createBuffer(2, length, ctx.sampleRate);
+  const impulse = ctx.createBuffer(channels, length, ctx.sampleRate);
   let seed = 9347;
 
   for (let channel = 0; channel < impulse.numberOfChannels; channel += 1) {

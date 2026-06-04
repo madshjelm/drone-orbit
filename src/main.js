@@ -24,9 +24,16 @@ const volumeControl = document.querySelector("#volumeControl");
 const bassControl = document.querySelector("#bassControl");
 const midControl = document.querySelector("#midControl");
 const highControl = document.querySelector("#highControl");
+const playToggle = document.querySelector("#playToggle");
+const sleepTimer = document.querySelector("#sleepTimer");
+
+const SETTINGS_KEY = "droneOrbit.settings";
 
 const state = {
   phase: "entry",
+  paused: false,
+  pausedAt: 0,
+  sleepTimer: null,
   settings: {
     speedValue: Number(speedControl.value) / 1000,
     volume: Number(volumeControl.value) / 100,
@@ -72,8 +79,12 @@ let lastFrame = performance.now();
 
 wireControls();
 requestAnimationFrame(tick);
+// Start fetching + decoding the soundscape immediately so Launch is instant.
+audio.preload(state.settings).catch(() => {});
 
 function wireControls() {
+  loadPersistedSettings();
+
   window.addEventListener("resize", () => renderer.resize());
   window.addEventListener("orientationchange", () => setTimeout(() => renderer.resize(), 80));
 
@@ -89,6 +100,7 @@ function wireControls() {
 
   speedControl.addEventListener("input", () => {
     state.settings.speedValue = Number(speedControl.value) / 1000;
+    persistSettings();
     updateHud();
   });
 
@@ -98,6 +110,8 @@ function wireControls() {
 
   directionToggle.addEventListener("click", startUTurn);
   orbitToggle.addEventListener("click", startOrbitTransfer);
+  playToggle.addEventListener("click", togglePlayback);
+  sleepTimer.addEventListener("change", () => startSleepTimer(Number(sleepTimer.value)));
 
   for (const control of [volumeControl, bassControl, midControl, highControl]) {
     control.addEventListener("input", () => {
@@ -106,6 +120,7 @@ function wireControls() {
       state.settings.eq.mid = Number(midControl.value);
       state.settings.eq.high = Number(highControl.value);
       audio.updateSettings(state.settings);
+      persistSettings();
     });
   }
 
@@ -176,9 +191,6 @@ async function launch() {
   }
 
   launchButton.disabled = true;
-  launchButton.textContent = "Loading drones";
-  loadMeter.hidden = false;
-  loadStatus.textContent = "Preparing audio buffers.";
   state.motion.angle = region.wedgeIndex * WEDGE_ANGLE;
   state.motion.ringMix = region.ring === "major" ? 1 : 0;
   state.motion.targetRingMix = state.motion.ringMix;
@@ -186,26 +198,38 @@ async function launch() {
   updateWeightTargets();
   updateZoneWeights(1);
 
+  // Audio is normally preloaded at page load, so this resolves instantly. Only
+  // surface a progress hint if a slow network means we actually have to wait.
+  const slowHint = window.setTimeout(() => {
+    loadMeter.hidden = false;
+    loadStatus.textContent = "Preparing audio.";
+  }, 120);
+
   try {
-    await audio.start(state.settings, (loaded, total, fallback) => {
+    await audio.start(state.settings, (loaded, total) => {
       loadBar.style.width = `${Math.round((loaded / total) * 100)}%`;
-      loadStatus.textContent = fallback
-        ? `Loaded ${loaded}/${total}; using preview drones where OGG files are missing.`
-        : `Loaded ${loaded}/${total}`;
+      loadStatus.textContent = `Loaded ${loaded}/${total}`;
     });
   } catch (error) {
+    window.clearTimeout(slowHint);
     loadStatus.textContent = error.message;
     launchButton.textContent = "Launch";
     launchButton.disabled = false;
     return;
   }
+  window.clearTimeout(slowHint);
+  loadMeter.hidden = true;
+  loadStatus.textContent = "";
 
   state.phase = "launching";
   state.motion.launchStart = performance.now();
   entryScreen.classList.add("is-hidden");
   directionToggle.disabled = false;
   orbitToggle.disabled = false;
+  playToggle.disabled = false;
   updateToggleText();
+  reflectPlaybackUI();
+  setupMediaSession();
 }
 
 function startUTurn() {
@@ -239,6 +263,141 @@ function startOrbitTransfer() {
   orbitToggle.disabled = true;
 }
 
+async function togglePlayback() {
+  if (state.phase === "entry") {
+    return;
+  }
+
+  state.paused = !state.paused;
+
+  if (state.paused) {
+    state.pausedAt = performance.now();
+    await audio.suspend();
+  } else {
+    audio.cancelFade();
+    audio.updateSettings(state.settings);
+    // Skip the paused wall-clock gap so the launch animation doesn't jump.
+    if (state.phase === "launching") {
+      state.motion.launchStart += performance.now() - state.pausedAt;
+    }
+    lastFrame = performance.now();
+    await audio.resumePlayback();
+  }
+
+  if ("mediaSession" in navigator) {
+    navigator.mediaSession.playbackState = state.paused ? "paused" : "playing";
+  }
+  reflectPlaybackUI();
+}
+
+function reflectPlaybackUI() {
+  playToggle.textContent = state.paused ? "Play" : "Pause";
+  playToggle.setAttribute("aria-pressed", state.paused ? "true" : "false");
+}
+
+function setupMediaSession() {
+  if (!("mediaSession" in navigator)) {
+    return;
+  }
+
+  try {
+    if (typeof MediaMetadata === "function") {
+      navigator.mediaSession.metadata = new MediaMetadata({
+        title: "Drone Orbit",
+        artist: "Ambient circle-of-fifths soundscape",
+        album: "Drone Orbit",
+        artwork: [
+          { src: "./icons/icon-192.png", sizes: "192x192", type: "image/png" },
+          { src: "./icons/icon-512.png", sizes: "512x512", type: "image/png" }
+        ]
+      });
+    }
+    navigator.mediaSession.setActionHandler("play", () => {
+      if (state.paused) {
+        togglePlayback();
+      }
+    });
+    navigator.mediaSession.setActionHandler("pause", () => {
+      if (!state.paused) {
+        togglePlayback();
+      }
+    });
+    navigator.mediaSession.setActionHandler("stop", () => {
+      if (!state.paused) {
+        togglePlayback();
+      }
+    });
+    navigator.mediaSession.playbackState = "playing";
+  } catch (error) {
+    /* media session is best-effort */
+  }
+}
+
+function startSleepTimer(minutes) {
+  window.clearTimeout(state.sleepTimer);
+  state.sleepTimer = null;
+  audio.cancelFade();
+
+  if (!minutes) {
+    return;
+  }
+
+  state.sleepTimer = window.setTimeout(() => {
+    audio.fadeOutAndPause(12);
+    window.setTimeout(() => {
+      if (!state.paused) {
+        state.paused = true;
+        state.pausedAt = performance.now();
+        if ("mediaSession" in navigator) {
+          navigator.mediaSession.playbackState = "paused";
+        }
+        reflectPlaybackUI();
+      }
+    }, 12100);
+  }, minutes * 60000);
+}
+
+function loadPersistedSettings() {
+  let saved = null;
+  try {
+    saved = JSON.parse(window.localStorage.getItem(SETTINGS_KEY) || "null");
+  } catch (error) {
+    saved = null;
+  }
+  if (!saved) {
+    return;
+  }
+
+  if (typeof saved.volume === "number") volumeControl.value = String(saved.volume);
+  if (typeof saved.bass === "number") bassControl.value = String(saved.bass);
+  if (typeof saved.mid === "number") midControl.value = String(saved.mid);
+  if (typeof saved.high === "number") highControl.value = String(saved.high);
+  if (typeof saved.speed === "number") speedControl.value = String(saved.speed);
+
+  state.settings.volume = Number(volumeControl.value) / 100;
+  state.settings.eq.bass = Number(bassControl.value);
+  state.settings.eq.mid = Number(midControl.value);
+  state.settings.eq.high = Number(highControl.value);
+  state.settings.speedValue = Number(speedControl.value) / 1000;
+}
+
+function persistSettings() {
+  try {
+    window.localStorage.setItem(
+      SETTINGS_KEY,
+      JSON.stringify({
+        volume: Number(volumeControl.value),
+        bass: Number(bassControl.value),
+        mid: Number(midControl.value),
+        high: Number(highControl.value),
+        speed: Number(speedControl.value)
+      })
+    );
+  } catch (error) {
+    /* storage may be unavailable (private mode) */
+  }
+}
+
 function tick(now) {
   const dt = Math.min(0.08, Math.max(0.001, (now - lastFrame) / 1000));
   lastFrame = now;
@@ -254,6 +413,10 @@ function tick(now) {
 }
 
 function updateMotion(dt, now) {
+  if (state.paused) {
+    return;
+  }
+
   const motion = state.motion;
 
   if (state.phase === "launching") {
