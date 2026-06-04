@@ -1,5 +1,9 @@
 const MASTER_RAMP_SECONDS = 0.05;
 const REGION_RAMP_SECONDS = 0.08;
+const REVERB_SECONDS = 6.2;
+const REVERB_DECAY = 4.1;
+const REVERB_WET_GAIN = 0.52;
+const REVERB_DRY_GAIN = 0.82;
 
 export class DroneAudioEngine {
   constructor(regions, zoneState) {
@@ -10,6 +14,7 @@ export class DroneAudioEngine {
     this.sources = [];
     this.master = null;
     this.eq = {};
+    this.reverb = {};
     this.started = false;
     this.usingFallback = false;
   }
@@ -73,6 +78,10 @@ export class DroneAudioEngine {
     this.eq.low = ctx.createBiquadFilter();
     this.eq.mid = ctx.createBiquadFilter();
     this.eq.high = ctx.createBiquadFilter();
+    this.reverb.dry = ctx.createGain();
+    this.reverb.preDelay = ctx.createDelay(0.18);
+    this.reverb.convolver = ctx.createConvolver();
+    this.reverb.wet = ctx.createGain();
     this.master = ctx.createGain();
 
     this.eq.low.type = "lowshelf";
@@ -82,10 +91,19 @@ export class DroneAudioEngine {
     this.eq.mid.Q.value = 0.9;
     this.eq.high.type = "highshelf";
     this.eq.high.frequency.value = 4000;
+    this.reverb.dry.gain.value = REVERB_DRY_GAIN;
+    this.reverb.preDelay.delayTime.value = 0.035;
+    this.reverb.convolver.buffer = createReverbImpulse(ctx, REVERB_SECONDS, REVERB_DECAY);
+    this.reverb.wet.gain.value = REVERB_WET_GAIN;
 
     this.eq.low.connect(this.eq.mid);
     this.eq.mid.connect(this.eq.high);
-    this.eq.high.connect(this.master);
+    this.eq.high.connect(this.reverb.dry);
+    this.eq.high.connect(this.reverb.preDelay);
+    this.reverb.preDelay.connect(this.reverb.convolver);
+    this.reverb.convolver.connect(this.reverb.wet);
+    this.reverb.dry.connect(this.master);
+    this.reverb.wet.connect(this.master);
     this.master.connect(ctx.destination);
     this.updateSettings(settings);
   }
@@ -132,28 +150,34 @@ export class DroneAudioEngine {
 
   createProceduralDrone(region) {
     const sampleRate = this.context.sampleRate;
-    const duration = 12;
+    const duration = 16;
     const frameCount = Math.floor(sampleRate * duration);
     const buffer = this.context.createBuffer(2, frameCount, sampleRate);
-    const root = quantizedFrequency(region.semitone, region.ring === "major" ? 36 : 24, duration);
-    const fifth = quantizedFrequency((region.semitone + 7) % 12, region.ring === "major" ? 43 : 31, duration);
-    const octave = quantizedFrequency(region.semitone, region.ring === "major" ? 48 : 36, duration);
-    const color = region.ring === "major" ? 1 : 0.76;
+    const rootMidi = 48 + region.semitone;
+    const root = quantizedFrequencyFromMidi(rootMidi, duration);
+    const rootDetuned = quantizedFrequencyFromMidi(rootMidi + 0.045, duration);
+    const fifth = quantizedFrequencyFromMidi(rootMidi + 7, duration);
+    const octave = quantizedFrequencyFromMidi(rootMidi + 12, duration);
+    const upperFifth = quantizedFrequencyFromMidi(rootMidi + 19, duration);
+    const airTone = quantizedFrequencyFromMidi(rootMidi + 24, duration);
+    const color = region.ring === "major" ? 1 : 0.86;
 
     for (let channel = 0; channel < 2; channel += 1) {
       const data = buffer.getChannelData(channel);
       const panPhase = channel === 0 ? 0 : Math.PI * 0.37;
       for (let i = 0; i < frameCount; i += 1) {
         const t = i / sampleRate;
-        const slow = 0.82 + 0.18 * Math.sin((Math.PI * 2 * t) / duration + panPhase);
-        const air = 0.015 * Math.sin((Math.PI * 2 * 7 * t) / duration + panPhase);
-        data[i] =
-          (0.18 * Math.sin(Math.PI * 2 * root * t + panPhase) +
-            0.12 * Math.sin(Math.PI * 2 * fifth * t + panPhase * 0.7) +
-            0.035 * Math.sin(Math.PI * 2 * octave * t + panPhase * 1.4) +
-            air) *
-          slow *
-          color;
+        const slow = 0.76 + 0.24 * Math.sin((Math.PI * 2 * t) / duration + panPhase);
+        const pulse = 0.9 + 0.1 * Math.sin((Math.PI * 4 * t) / duration + panPhase * 1.6);
+        const shimmer = 0.55 + 0.45 * Math.sin((Math.PI * 6 * t) / duration + panPhase * 0.8);
+        const raw =
+          0.28 * Math.sin(Math.PI * 2 * root * t + panPhase) +
+          0.2 * Math.sin(Math.PI * 2 * rootDetuned * t + panPhase * 1.2) +
+          0.19 * Math.sin(Math.PI * 2 * fifth * t + panPhase * 0.7) +
+          0.1 * Math.sin(Math.PI * 2 * octave * t + panPhase * 1.4) +
+          0.055 * Math.sin(Math.PI * 2 * upperFifth * t + panPhase * 1.9) * shimmer +
+          0.025 * Math.sin(Math.PI * 2 * airTone * t + panPhase * 2.3);
+        data[i] = Math.tanh(raw * 1.45) * slow * pulse * color * 0.72;
       }
     }
 
@@ -161,8 +185,32 @@ export class DroneAudioEngine {
   }
 }
 
-function quantizedFrequency(semitone, baseMidi, duration) {
-  const midi = baseMidi + semitone;
+function quantizedFrequencyFromMidi(midi, duration) {
   const frequency = 440 * 2 ** ((midi - 69) / 12);
   return Math.max(1, Math.round(frequency * duration) / duration);
+}
+
+function createReverbImpulse(ctx, seconds, decay) {
+  const length = Math.floor(ctx.sampleRate * seconds);
+  const impulse = ctx.createBuffer(2, length, ctx.sampleRate);
+  let seed = 9347;
+
+  for (let channel = 0; channel < impulse.numberOfChannels; channel += 1) {
+    const data = impulse.getChannelData(channel);
+    const channelPhase = channel === 0 ? 0 : Math.PI * 0.31;
+    for (let i = 0; i < length; i += 1) {
+      seed = (seed * 48271) % 2147483647;
+      const noise = (seed / 2147483647) * 2 - 1;
+      const t = i / length;
+      const envelope = (1 - t) ** decay;
+      const earlyBloom = Math.min(1, i / (ctx.sampleRate * 0.08));
+      const modulation =
+        0.86 +
+        0.1 * Math.sin(Math.PI * 2 * 3.1 * t + channelPhase) +
+        0.04 * Math.sin(Math.PI * 2 * 11.7 * t + channelPhase);
+      data[i] = noise * envelope * earlyBloom * modulation;
+    }
+  }
+
+  return impulse;
 }
