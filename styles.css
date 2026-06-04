@@ -297,6 +297,33 @@ input[type="range"] {
   background: rgba(143, 232, 255, 0.16);
 }
 
+.play-toggle {
+  width: 100%;
+  font-weight: 680;
+}
+
+.play-toggle[aria-pressed="true"] {
+  border-color: rgba(245, 193, 90, 0.66);
+  background: rgba(245, 193, 90, 0.16);
+}
+
+select#sleepTimer {
+  width: 100%;
+  min-height: 44px;
+  padding: 0 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  color: var(--text);
+  background: rgba(255, 255, 255, 0.08);
+}
+
+/* Off-screen (not display:none, which can suspend playback) sink that carries
+   the Web Audio output through a media element for OS controls + background. */
+/* #mediaSink carries the Web Audio output through a media element so mobile
+   browsers expose OS media controls + background playback. A controls-less
+   <audio> stays at the UA's display:none (can't be overridden, and that's fine —
+   it still plays the MediaStream), so no rule is needed here. */
+
 .about {
   color: var(--muted);
   font-size: 14px;

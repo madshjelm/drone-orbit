@@ -4,7 +4,12 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
     <meta name="theme-color" content="#030612">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+    <meta name="apple-mobile-web-app-title" content="Drone Orbit">
     <title>Drone Orbit</title>
+    <link rel="manifest" href="./manifest.webmanifest">
+    <link rel="apple-touch-icon" href="./icons/icon-192.png">
     <link rel="stylesheet" href="./styles.css">
   </head>
   <body>
@@ -44,6 +49,20 @@
           <h2>Orbit Controls</h2>
           <button id="panelClose" class="plain-button" type="button">Close</button>
         </div>
+
+        <section class="control-group" aria-labelledby="playbackHeading">
+          <h3 id="playbackHeading">Playback</h3>
+          <button id="playToggle" class="play-toggle" type="button" aria-pressed="false" disabled>Pause</button>
+          <label class="control-row" for="sleepTimer">
+            <span>Sleep</span>
+            <select id="sleepTimer">
+              <option value="0">Off</option>
+              <option value="15">15 min</option>
+              <option value="30">30 min</option>
+              <option value="60">60 min</option>
+            </select>
+          </label>
+        </section>
 
         <section class="control-group" aria-labelledby="flightHeading">
           <h3 id="flightHeading">Flight</h3>
@@ -92,6 +111,8 @@
         </section>
       </aside>
     </main>
+
+    <audio id="mediaSink" loop playsinline aria-hidden="true" tabindex="-1"></audio>
 
     <script type="module" src="./src/main.js"></script>
   </body>
