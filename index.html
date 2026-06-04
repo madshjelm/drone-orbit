@@ -1,0 +1,98 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+    <meta name="theme-color" content="#030612">
+    <title>Drone Orbit</title>
+    <link rel="stylesheet" href="./styles.css">
+  </head>
+  <body>
+    <main id="app" aria-label="Drone Orbit interactive soundscape">
+      <canvas id="orbitCanvas" aria-label="Circle of fifths orbit map"></canvas>
+
+      <section class="hud" aria-live="polite" aria-atomic="true">
+        <div class="hud__key" id="currentKey">Now orbiting: C major</div>
+        <div class="hud__meta">
+          <span id="directionReadout">CW</span>
+          <span id="orbitReadout">Major</span>
+          <span id="speedReadout">60s/key</span>
+        </div>
+      </section>
+
+      <button class="panel-toggle" id="panelToggle" type="button" aria-controls="settingsPanel" aria-expanded="false">
+        Menu
+      </button>
+
+      <section class="entry" id="entryScreen" aria-labelledby="entryTitle">
+        <div class="entry__copy">
+          <p class="eyebrow">Circle of fifths soundscape</p>
+          <h1 id="entryTitle">Drone Orbit</h1>
+          <p id="selectedKeyText">Choose a launch key on the orbit map.</p>
+        </div>
+        <div class="entry__actions">
+          <div class="load-meter" id="loadMeter" hidden>
+            <div class="load-meter__bar" id="loadBar"></div>
+          </div>
+          <button id="launchButton" class="launch-button" type="button" disabled>Launch</button>
+          <p class="entry__status" id="loadStatus" role="status"></p>
+        </div>
+      </section>
+
+      <aside class="settings" id="settingsPanel" aria-label="Settings panel" aria-hidden="true">
+        <div class="settings__header">
+          <h2>Orbit Controls</h2>
+          <button id="panelClose" class="plain-button" type="button">Close</button>
+        </div>
+
+        <section class="control-group" aria-labelledby="flightHeading">
+          <h3 id="flightHeading">Flight</h3>
+          <label class="control-row" for="speedControl">
+            <span>Speed</span>
+            <input id="speedControl" type="range" min="0" max="1000" value="360">
+          </label>
+          <div class="segmented">
+            <button id="directionToggle" type="button" aria-pressed="true" disabled>CW</button>
+            <button id="orbitToggle" type="button" aria-pressed="true" disabled>Major</button>
+          </div>
+        </section>
+
+        <section class="control-group" aria-labelledby="audioHeading">
+          <h3 id="audioHeading">Audio</h3>
+          <label class="control-row" for="volumeControl">
+            <span>Volume</span>
+            <input id="volumeControl" type="range" min="0" max="100" value="78">
+          </label>
+          <label class="control-row" for="bassControl">
+            <span>Bass</span>
+            <input id="bassControl" type="range" min="-12" max="12" value="0">
+          </label>
+          <label class="control-row" for="midControl">
+            <span>Mid</span>
+            <input id="midControl" type="range" min="-12" max="12" value="0">
+          </label>
+          <label class="control-row" for="highControl">
+            <span>High</span>
+            <input id="highControl" type="range" min="-12" max="12" value="0">
+          </label>
+        </section>
+
+        <section class="control-group" aria-labelledby="viewHeading">
+          <h3 id="viewHeading">View</h3>
+          <label class="control-row" for="zoomControl">
+            <span>Zoom</span>
+            <input id="zoomControl" type="range" min="100" max="280" value="100">
+          </label>
+        </section>
+
+        <section class="control-group about" aria-labelledby="aboutHeading">
+          <h3 id="aboutHeading">About The Circle</h3>
+          <p>Each high orbit is a major key; each low orbit is its relative minor. Flying clockwise moves by perfect fifths, while changing altitude moves to a key with the same notes.</p>
+          <p>The fifth is the 3:2 ratio, a naturally consonant interval. Stacking fifths visits all twelve tones, turning the old music-of-the-spheres idea into a route through space.</p>
+        </section>
+      </aside>
+    </main>
+
+    <script type="module" src="./src/main.js"></script>
+  </body>
+</html>
