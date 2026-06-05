@@ -30,9 +30,30 @@ WordPress/Elementor fullscreen iframe:
 </iframe>
 ```
 
+The app prioritizes stable foreground audio on Android. Android Chrome and
+iframe embeds use direct Web Audio output; the hidden media-element sink remains
+best-effort for non-Android media controls/background behavior.
+
 ## Audio Files
 
-Upload loopable OGG files to the configured relative paths:
+Upload loopable files to the configured relative paths. For best compatibility,
+provide the same stem in this order:
+
+```text
+audio/<ring>/<key>.webm  WebM/Opus, 48 kHz stereo, 96-128 kbps
+audio/<ring>/<key>.ogg   OGG/Vorbis, 48 kHz stereo
+audio/<ring>/<key>.m4a   MP4/AAC, 48 kHz stereo, 128 kbps
+audio/<ring>/<key>.mp3   Optional MP3 fallback
+```
+
+The current app ships fallback WebM/Opus and M4A/AAC files for the existing
+`C`, `D`, and `G` major loops. Keep replacement files exactly loopable; if an
+encoded fallback adds padding, update the region `loopDuration` metadata in
+`src/config.js` to the intended OGG loop length. When adding a new key, also add
+its `audio/<ring>/<key>` stem to `availableAudioStems` in `src/config.js` so the
+app fetches it.
+
+Configured key stems:
 
 ```text
 audio/major/C.ogg
@@ -62,4 +83,10 @@ audio/minor/Gm.ogg
 audio/minor/Dm.ogg
 ```
 
-Until those files exist, the launch flow generates procedural preview drones in the browser so the interaction can still be tested.
+Missing audio files are treated as silent regions.
+
+## Diagnostics
+
+Append `?diagnostics=1` to the app URL during device testing to show runtime
+profile, selected audio format, output mode, active voices, decode/fetch
+failures, loop-padding trims, and long-frame counts.

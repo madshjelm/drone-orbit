@@ -1,7 +1,9 @@
 import { TAU, WEDGE_ANGLE, WEDGE_COUNT, geometry, normalizeAngle, regionFor, regions } from "./config.js";
+import { getRuntimeProfile } from "./device.js";
 
-const reducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
-const liteMode = detectLiteMode();
+const runtimeProfile = getRuntimeProfile();
+const reducedMotion = runtimeProfile.prefersReducedMotion;
+const liteMode = runtimeProfile.constrained;
 
 // Equirectangular Earth texture resolution. Generated once at startup; this is
 // plenty for the small on-screen sphere.
@@ -60,7 +62,8 @@ export class OrbitRenderer {
     const rect = this.canvas.getBoundingClientRect();
     const width = Math.max(1, rect.width || window.innerWidth);
     const height = Math.max(1, rect.height || window.innerHeight);
-    const dpr = Math.min(2, window.devicePixelRatio || 1);
+    const dprCap = liteMode ? 1.25 : 2;
+    const dpr = Math.min(dprCap, window.devicePixelRatio || 1);
 
     this.width = width;
     this.height = height;
@@ -72,7 +75,8 @@ export class OrbitRenderer {
     this.canvas.height = Math.round(height * dpr);
 
     // Glow buffer: small, fixed target on the long edge regardless of DPI.
-    this.glowScale = clamp(360 / (Math.max(width, height) * dpr), 0.08, 0.5);
+    const glowTarget = liteMode ? 220 : 360;
+    this.glowScale = clamp(glowTarget / (Math.max(width, height) * dpr), 0.08, 0.5);
     this.glowCanvas.width = Math.max(1, Math.round(width * dpr * this.glowScale));
     this.glowCanvas.height = Math.max(1, Math.round(height * dpr * this.glowScale));
 
@@ -149,7 +153,7 @@ export class OrbitRenderer {
     // Two star layers, baked straight into the sky so the whole backdrop costs
     // a single blit per frame.
     const area = W * H;
-    this.paintStars(ctx, Math.round(area / 1500), {
+    this.paintStars(ctx, Math.round(area / (liteMode ? 2600 : 1500)), {
       minSize: 0.35,
       maxSize: 0.95,
       minAlpha: 0.25,
@@ -157,7 +161,7 @@ export class OrbitRenderer {
       glowChance: 0.03,
       seed: 4051
     });
-    this.paintStars(ctx, Math.round(area / 5200), {
+    this.paintStars(ctx, Math.round(area / (liteMode ? 8200 : 5200)), {
       minSize: 0.7,
       maxSize: 1.7,
       minAlpha: 0.5,
@@ -201,7 +205,7 @@ export class OrbitRenderer {
     // A handful of bright twinkling beacons, drawn live for a sense of life.
     const area = this.width * this.height;
     const rng = mulberry32(90210);
-    const count = Math.max(14, Math.round(area / 36000));
+    const count = liteMode ? 0 : Math.max(14, Math.round(area / 36000));
     this.twinkles = [];
     for (let i = 0; i < count; i += 1) {
       this.twinkles.push({
@@ -220,7 +224,7 @@ export class OrbitRenderer {
 
   buildPlanetBuffer() {
     const planetR = this.radius * geometry.planetRadiusRatio;
-    const cap = liteMode ? 150 : PLANET_MAX_PX;
+    const cap = liteMode ? 96 : PLANET_MAX_PX;
     const px = Math.max(32, Math.min(cap, Math.round(planetR * 2 * this.dpr)));
     if (px === this.planetPx && this.planetImage) {
       return;
@@ -310,6 +314,10 @@ export class OrbitRenderer {
   }
 
   drawTwinkles(ctx, time) {
+    if (liteMode) {
+      return;
+    }
+
     const t = reducedMotion ? 0 : time * 0.001;
     ctx.save();
     ctx.globalCompositeOperation = "lighter";
@@ -341,7 +349,7 @@ export class OrbitRenderer {
   }
 
   drawMeteor(ctx, time, dt) {
-    if (reducedMotion) {
+    if (reducedMotion || liteMode) {
       return;
     }
 
@@ -567,7 +575,7 @@ export class OrbitRenderer {
     // Hold the globe still until launch (and for reduced motion) so the intro
     // costs almost nothing while audio preloads. Once flying, rotate but cap the
     // per-pixel pass to ~20-30 Hz since the sphere turns slowly.
-    const frozen = reducedMotion || this.state.phase === "entry";
+    const frozen = reducedMotion || liteMode || this.state.phase === "entry";
     if (frozen) {
       if (this.planetFrozen) {
         return;
@@ -1079,19 +1087,6 @@ function mulberry32(seed) {
 function normalize3(x, y, z) {
   const l = Math.hypot(x, y, z) || 1;
   return [x / l, y / l, z / l];
-}
-
-// Phones / low-power devices get a lighter planet render (matches the audio
-// engine's own detection so both ease off together).
-function detectLiteMode() {
-  try {
-    const coarse = typeof window.matchMedia === "function" && window.matchMedia("(pointer: coarse)").matches;
-    const lowCores = (navigator.hardwareConcurrency || 8) <= 4;
-    const mobileUA = /Android|iPhone|iPad|iPod|Mobile/i.test(navigator.userAgent || "");
-    return Boolean((coarse && lowCores) || mobileUA);
-  } catch (error) {
-    return false;
-  }
 }
 
 function polar(angle, radius) {
