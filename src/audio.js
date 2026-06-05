@@ -1,20 +1,6 @@
 const MASTER_RAMP_SECONDS = 0.05;
 const REGION_RAMP_SECONDS = 0.08;
 
-// Lightweight algorithmic reverb (parallel damped feedback combs) instead of a
-// long convolution impulse — far cheaper on the audio thread, which is the main
-// cause of stutter on weaker / mobile devices.
-const REVERB_COMB_MS = [31.7, 37.1, 41.1, 43.7, 26.5, 29.3];
-const REVERB_FEEDBACK = 0.82;
-const REVERB_DAMP_HZ = 2600;
-const REVERB_PREDELAY = 0.035;
-const REVERB_WET_GAIN = 0.26;
-const REVERB_DRY_GAIN = 0.82;
-
-// Procedural placeholder drones (used until real OGG files exist). Kept short and
-// generated with yields so building them never blocks the entry screen.
-const PROC_DURATION = 8;
-
 // Mobile-friendly mix scheduling.
 const MIX_THROTTLE_MS = 50; // ~20 Hz instead of per animation frame
 const MIX_GATE = 0.001; // skip gain ramps smaller than this
@@ -34,11 +20,8 @@ export class DroneAudioEngine {
     this.buffers = [];
     this.master = null;
     this.eq = {};
-    this.reverb = {};
     this.started = false;
     this.preloaded = false;
-    this.usingFallback = false;
-    this.liteMode = detectLiteMode();
     this.ready = null;
     this._loaded = 0;
     this._lastMixAt = 0;
@@ -66,16 +49,15 @@ export class DroneAudioEngine {
     this.createBus(settings);
 
     this._loaded = 0;
-    // Kick the network fetches off in parallel, but decode / synthesise one at a
-    // time with a yield between each so the main thread never stalls (decoding is
-    // off-thread, but procedural synthesis runs here).
+    // Fetch in parallel, decode one at a time with a yield between each. Regions
+    // without an audio file simply stay null (silent) — no placeholder audio.
     this.ready = (async () => {
       const pending = this.regions.map((region) => this.fetchAudio(region));
       for (let index = 0; index < this.regions.length; index += 1) {
         const data = await pending[index];
-        this.buffers[index] = await this.decodeOrSynthesize(this.regions[index], data);
+        this.buffers[index] = await this.decodeBuffer(data);
         this._loaded += 1;
-        onProgress(this._loaded, this.regions.length, this.usingFallback);
+        onProgress(this._loaded, this.regions.length);
         await yieldToMainThread();
       }
     })();
@@ -219,9 +201,6 @@ export class DroneAudioEngine {
     this.eq.low = ctx.createBiquadFilter();
     this.eq.mid = ctx.createBiquadFilter();
     this.eq.high = ctx.createBiquadFilter();
-    this.reverb.dry = ctx.createGain();
-    this.reverb.preDelay = ctx.createDelay(0.18);
-    this.reverb.wet = ctx.createGain();
     this.master = ctx.createGain();
 
     this.eq.low.type = "lowshelf";
@@ -231,36 +210,12 @@ export class DroneAudioEngine {
     this.eq.mid.Q.value = 0.9;
     this.eq.high.type = "highshelf";
     this.eq.high.frequency.value = 4000;
-    this.reverb.dry.gain.value = REVERB_DRY_GAIN;
-    this.reverb.preDelay.delayTime.value = REVERB_PREDELAY;
-    this.reverb.wet.gain.value = REVERB_WET_GAIN;
 
-    // Parallel damped feedback combs form a cheap, smooth reverb. Fewer lines on
-    // mobile. (No ConvolverNode — that was the heaviest audio-thread node.)
-    const combCount = this.liteMode ? 3 : REVERB_COMB_MS.length;
-    this.reverb.combs = [];
-    for (let i = 0; i < combCount; i += 1) {
-      const delay = ctx.createDelay(0.1);
-      delay.delayTime.value = REVERB_COMB_MS[i] / 1000;
-      const damp = ctx.createBiquadFilter();
-      damp.type = "lowpass";
-      damp.frequency.value = REVERB_DAMP_HZ;
-      const feedback = ctx.createGain();
-      feedback.gain.value = REVERB_FEEDBACK;
-      this.reverb.preDelay.connect(delay);
-      delay.connect(damp);
-      damp.connect(feedback);
-      feedback.connect(delay);
-      delay.connect(this.reverb.wet);
-      this.reverb.combs.push({ delay, damp, feedback });
-    }
-
+    // Dry, clean signal path: sources -> region gains -> EQ -> master. No reverb
+    // (the loops carry their own space); keeps the mix stable and light.
     this.eq.low.connect(this.eq.mid);
     this.eq.mid.connect(this.eq.high);
-    this.eq.high.connect(this.reverb.dry);
-    this.eq.high.connect(this.reverb.preDelay);
-    this.reverb.dry.connect(this.master);
-    this.reverb.wet.connect(this.master);
+    this.eq.high.connect(this.master);
     // The master sink (MediaStream or destination) is chosen by setupOutputSink().
     this.updateSettings(settings);
   }
@@ -291,6 +246,10 @@ export class DroneAudioEngine {
     const ctx = this.context;
     const now = ctx.currentTime;
     for (let index = 0; index < this.regions.length; index += 1) {
+      // Regions without an audio file are silent — nothing to schedule.
+      if (!this.buffers[index]) {
+        continue;
+      }
       const weight = Math.max(0, Math.min(1, this.zoneState[index].weight));
       const gain = Math.sin(weight * Math.PI * 0.5);
       const voice = this.voices[index];
@@ -357,7 +316,7 @@ export class DroneAudioEngine {
 
   async fetchAudio(region) {
     try {
-      const response = await fetch(region.audioPath, { cache: "force-cache" });
+      const response = await fetch(region.audioPath);
       if (!response.ok) {
         return null;
       }
@@ -367,148 +326,20 @@ export class DroneAudioEngine {
     }
   }
 
-  async decodeOrSynthesize(region, data) {
-    if (data) {
-      try {
-        return await this.context.decodeAudioData(data);
-      } catch (error) {
-        /* fall back to a synthesised placeholder */
-      }
+  async decodeBuffer(data) {
+    if (!data) {
+      return null;
     }
-    this.usingFallback = true;
-    return this.createProceduralDrone(region);
-  }
-
-  // Render a placeholder drone with an OfflineAudioContext so the synthesis runs
-  // off the main thread (a per-sample JS loop here was the cause of the choppy
-  // intro when OGG files are missing). Falls back to the sync loop if needed.
-  async createProceduralDrone(region) {
-    const OfflineCtx = window.OfflineAudioContext || window.webkitOfflineAudioContext;
-    if (!OfflineCtx) {
-      return this.createProceduralDroneSync(region);
+    try {
+      return await this.context.decodeAudioData(data);
+    } catch (error) {
+      return null;
     }
-
-    const sampleRate = this.context.sampleRate;
-    const duration = PROC_DURATION;
-    const frames = Math.max(1, Math.floor(sampleRate * duration));
-    const oac = new OfflineCtx(2, frames, sampleRate);
-    const rootMidi = 48 + region.semitone;
-    const color = region.ring === "major" ? 1 : 0.86;
-
-    const sum = oac.createGain();
-    sum.gain.value = 1;
-    const partials = [
-      { semi: 0, amp: 0.28 },
-      { semi: 0.045, amp: 0.2 },
-      { semi: 7, amp: 0.19 },
-      { semi: 12, amp: 0.1 },
-      { semi: 19, amp: 0.055 },
-      { semi: 24, amp: 0.025 }
-    ];
-    for (const partial of partials) {
-      const osc = oac.createOscillator();
-      osc.type = "sine";
-      osc.frequency.value = quantizedFrequencyFromMidi(rootMidi + partial.semi, duration);
-      const gain = oac.createGain();
-      gain.gain.value = partial.amp;
-      osc.connect(gain);
-      gain.connect(sum);
-      osc.start(0);
-      osc.stop(duration);
-    }
-
-    // tanh saturation, then a slow amplitude "breath" driven by an LFO.
-    const shaper = oac.createWaveShaper();
-    shaper.curve = makeTanhCurve(1.45);
-
-    const breath = oac.createGain();
-    breath.gain.value = 0.78;
-    const lfo = oac.createOscillator();
-    lfo.type = "sine";
-    lfo.frequency.value = 1 / duration;
-    const lfoGain = oac.createGain();
-    lfoGain.gain.value = 0.22;
-    lfo.connect(lfoGain);
-    lfoGain.connect(breath.gain);
-    lfo.start(0);
-    lfo.stop(duration);
-
-    const out = oac.createGain();
-    out.gain.value = color * 0.72;
-
-    sum.connect(shaper);
-    shaper.connect(breath);
-    breath.connect(out);
-    out.connect(oac.destination);
-
-    return oac.startRendering();
   }
-
-  createProceduralDroneSync(region) {
-    const sampleRate = this.context.sampleRate;
-    const duration = PROC_DURATION;
-    const frameCount = Math.floor(sampleRate * duration);
-    const buffer = this.context.createBuffer(2, frameCount, sampleRate);
-    const rootMidi = 48 + region.semitone;
-    const root = quantizedFrequencyFromMidi(rootMidi, duration);
-    const rootDetuned = quantizedFrequencyFromMidi(rootMidi + 0.045, duration);
-    const fifth = quantizedFrequencyFromMidi(rootMidi + 7, duration);
-    const octave = quantizedFrequencyFromMidi(rootMidi + 12, duration);
-    const upperFifth = quantizedFrequencyFromMidi(rootMidi + 19, duration);
-    const airTone = quantizedFrequencyFromMidi(rootMidi + 24, duration);
-    const color = region.ring === "major" ? 1 : 0.86;
-
-    for (let channel = 0; channel < 2; channel += 1) {
-      const data = buffer.getChannelData(channel);
-      const panPhase = channel === 0 ? 0 : Math.PI * 0.37;
-      for (let i = 0; i < frameCount; i += 1) {
-        const t = i / sampleRate;
-        const slow = 0.76 + 0.24 * Math.sin((Math.PI * 2 * t) / duration + panPhase);
-        const pulse = 0.9 + 0.1 * Math.sin((Math.PI * 4 * t) / duration + panPhase * 1.6);
-        const shimmer = 0.55 + 0.45 * Math.sin((Math.PI * 6 * t) / duration + panPhase * 0.8);
-        const raw =
-          0.28 * Math.sin(Math.PI * 2 * root * t + panPhase) +
-          0.2 * Math.sin(Math.PI * 2 * rootDetuned * t + panPhase * 1.2) +
-          0.19 * Math.sin(Math.PI * 2 * fifth * t + panPhase * 0.7) +
-          0.1 * Math.sin(Math.PI * 2 * octave * t + panPhase * 1.4) +
-          0.055 * Math.sin(Math.PI * 2 * upperFifth * t + panPhase * 1.9) * shimmer +
-          0.025 * Math.sin(Math.PI * 2 * airTone * t + panPhase * 2.3);
-        data[i] = Math.tanh(raw * 1.45) * slow * pulse * color * 0.72;
-      }
-    }
-
-    return buffer;
-  }
-}
-
-function detectLiteMode() {
-  try {
-    const coarse = typeof window.matchMedia === "function" && window.matchMedia("(pointer: coarse)").matches;
-    const lowCores = (navigator.hardwareConcurrency || 8) <= 4;
-    const mobileUA = /Android|iPhone|iPad|iPod|Mobile/i.test(navigator.userAgent || "");
-    return Boolean((coarse && lowCores) || mobileUA);
-  } catch (error) {
-    return false;
-  }
-}
-
-function quantizedFrequencyFromMidi(midi, duration) {
-  const frequency = 440 * 2 ** ((midi - 69) / 12);
-  return Math.max(1, Math.round(frequency * duration) / duration);
 }
 
 function yieldToMainThread() {
   return new Promise((resolve) => {
     window.setTimeout(resolve, 0);
   });
-}
-
-function makeTanhCurve(drive) {
-  const n = 1024;
-  const curve = new Float32Array(n);
-  for (let i = 0; i < n; i += 1) {
-    const x = (i / (n - 1)) * 2 - 1;
-    curve[i] = Math.tanh(x * drive);
-  }
-  return curve;
 }

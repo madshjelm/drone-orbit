@@ -27,7 +27,13 @@ const highControl = document.querySelector("#highControl");
 const playToggle = document.querySelector("#playToggle");
 const sleepTimer = document.querySelector("#sleepTimer");
 
-const SETTINGS_KEY = "droneOrbit.settings";
+// Always start from clean defaults — clear any preferences a previous version
+// stored so a stale value can never carry over between loads.
+try {
+  window.localStorage.removeItem("droneOrbit.settings");
+} catch (error) {
+  /* storage may be unavailable */
+}
 
 const state = {
   phase: "entry",
@@ -93,8 +99,6 @@ function schedulePreload() {
 }
 
 function wireControls() {
-  loadPersistedSettings();
-
   window.addEventListener("resize", () => renderer.resize());
   window.addEventListener("orientationchange", () => setTimeout(() => renderer.resize(), 80));
 
@@ -110,7 +114,6 @@ function wireControls() {
 
   speedControl.addEventListener("input", () => {
     state.settings.speedValue = Number(speedControl.value) / 1000;
-    persistSettings();
     updateHud();
   });
 
@@ -130,7 +133,6 @@ function wireControls() {
       state.settings.eq.mid = Number(midControl.value);
       state.settings.eq.high = Number(highControl.value);
       audio.updateSettings(state.settings);
-      persistSettings();
     });
   }
 
@@ -365,47 +367,6 @@ function startSleepTimer(minutes) {
       }
     }, 12100);
   }, minutes * 60000);
-}
-
-function loadPersistedSettings() {
-  let saved = null;
-  try {
-    saved = JSON.parse(window.localStorage.getItem(SETTINGS_KEY) || "null");
-  } catch (error) {
-    saved = null;
-  }
-  if (!saved) {
-    return;
-  }
-
-  if (typeof saved.volume === "number") volumeControl.value = String(saved.volume);
-  if (typeof saved.bass === "number") bassControl.value = String(saved.bass);
-  if (typeof saved.mid === "number") midControl.value = String(saved.mid);
-  if (typeof saved.high === "number") highControl.value = String(saved.high);
-  if (typeof saved.speed === "number") speedControl.value = String(saved.speed);
-
-  state.settings.volume = Number(volumeControl.value) / 100;
-  state.settings.eq.bass = Number(bassControl.value);
-  state.settings.eq.mid = Number(midControl.value);
-  state.settings.eq.high = Number(highControl.value);
-  state.settings.speedValue = Number(speedControl.value) / 1000;
-}
-
-function persistSettings() {
-  try {
-    window.localStorage.setItem(
-      SETTINGS_KEY,
-      JSON.stringify({
-        volume: Number(volumeControl.value),
-        bass: Number(bassControl.value),
-        mid: Number(midControl.value),
-        high: Number(highControl.value),
-        speed: Number(speedControl.value)
-      })
-    );
-  } catch (error) {
-    /* storage may be unavailable (private mode) */
-  }
 }
 
 function tick(now) {
