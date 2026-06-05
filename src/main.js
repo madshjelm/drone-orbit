@@ -1,4 +1,5 @@
 import { DroneAudioEngine } from "./audio.js";
+import { getRuntimeProfile } from "./device.js";
 import { OrbitRenderer } from "./renderer.js";
 import { WEDGE_ANGLE, WEDGE_COUNT, normalizeAngle, regionFor, regionIndex, regions, ringDisplay } from "./config.js";
 
@@ -79,6 +80,8 @@ const state = {
 
 const renderer = new OrbitRenderer(canvas, state);
 const audio = new DroneAudioEngine(regions, state.zoneState);
+const runtimeProfile = getRuntimeProfile();
+const diagnostics = createDiagnosticsPanel();
 const pointers = new Map();
 let pinchStart = null;
 let lastFrame = performance.now();
@@ -370,7 +373,9 @@ function startSleepTimer(minutes) {
 }
 
 function tick(now) {
-  const dt = Math.min(0.08, Math.max(0.001, (now - lastFrame) / 1000));
+  const frameMs = now - lastFrame;
+  recordFrameDiagnostics(frameMs);
+  const dt = Math.min(0.08, Math.max(0.001, frameMs / 1000));
   lastFrame = now;
 
   updateMotion(dt, now);
@@ -380,6 +385,7 @@ function tick(now) {
   audio.updateMix();
   updateHud();
   renderer.draw(now);
+  updateDiagnosticsPanel(now);
   requestAnimationFrame(tick);
 }
 
@@ -578,4 +584,65 @@ function easeInOut(t) {
 
 function easeOutCubic(t) {
   return 1 - (1 - Math.max(0, Math.min(1, t))) ** 3;
+}
+
+function createDiagnosticsPanel() {
+  const params = new URLSearchParams(window.location.search);
+  if (!params.has("diagnostics")) {
+    return null;
+  }
+
+  const panel = document.createElement("pre");
+  panel.setAttribute("aria-label", "Diagnostics");
+  panel.style.position = "fixed";
+  panel.style.left = "10px";
+  panel.style.bottom = "10px";
+  panel.style.zIndex = "20";
+  panel.style.maxWidth = "min(520px, calc(100vw - 20px))";
+  panel.style.maxHeight = "45vh";
+  panel.style.margin = "0";
+  panel.style.padding = "10px";
+  panel.style.overflow = "auto";
+  panel.style.border = "1px solid rgba(255, 255, 255, 0.24)";
+  panel.style.borderRadius = "6px";
+  panel.style.background = "rgba(0, 0, 0, 0.74)";
+  panel.style.color = "#d7f7ff";
+  panel.style.font = "11px/1.35 ui-monospace, SFMono-Regular, Consolas, monospace";
+  panel.style.pointerEvents = "none";
+  document.body.append(panel);
+
+  return {
+    panel,
+    lastUpdate: 0,
+    longFrames: 0,
+    maxFrameMs: 0
+  };
+}
+
+function recordFrameDiagnostics(frameMs) {
+  if (!diagnostics) {
+    return;
+  }
+  if (frameMs > 80) {
+    diagnostics.longFrames += 1;
+  }
+  diagnostics.maxFrameMs = Math.max(diagnostics.maxFrameMs, frameMs);
+}
+
+function updateDiagnosticsPanel(now) {
+  if (!diagnostics || now - diagnostics.lastUpdate < 500) {
+    return;
+  }
+
+  diagnostics.lastUpdate = now;
+  diagnostics.panel.textContent = JSON.stringify({
+    runtimeProfile,
+    phase: state.phase,
+    paused: state.paused,
+    frame: {
+      longFrames: diagnostics.longFrames,
+      maxFrameMs: Math.round(diagnostics.maxFrameMs)
+    },
+    audio: audio.getDiagnostics()
+  }, null, 2);
 }

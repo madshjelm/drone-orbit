@@ -24,6 +24,18 @@ export const wedges = [
   { major: "F", majorFile: "F.ogg", majorSemitone: 5, minor: "Dm", minorFile: "Dm.ogg", minorSemitone: 2 }
 ];
 
+const loopDurations = {
+  "major/C.ogg": 74.2936875,
+  "major/D.ogg": 74.94385416666667,
+  "major/G.ogg": 74.2936875
+};
+
+const availableAudioStems = new Set([
+  "audio/major/C",
+  "audio/major/D",
+  "audio/major/G"
+]);
+
 export const regions = [
   ...wedges.map((wedge, wedgeIndex) => ({
     index: wedgeIndex,
@@ -34,7 +46,8 @@ export const regions = [
     label: `${wedge.major} major`,
     display: wedge.major,
     semitone: wedge.majorSemitone,
-    audioPath: `audio/major/${wedge.majorFile}`
+    loopDuration: loopDurations[`major/${wedge.majorFile}`] || null,
+    audioSources: audioSourcesFor("major", wedge.majorFile)
   })),
   ...wedges.map((wedge, wedgeIndex) => ({
     index: WEDGE_COUNT + wedgeIndex,
@@ -45,9 +58,25 @@ export const regions = [
     label: `${wedge.minor} minor`,
     display: wedge.minor,
     semitone: wedge.minorSemitone,
-    audioPath: `audio/minor/${wedge.minorFile}`
+    loopDuration: loopDurations[`minor/${wedge.minorFile}`] || null,
+    audioSources: audioSourcesFor("minor", wedge.minorFile)
   }))
 ];
+
+function audioSourcesFor(ring, file) {
+  const stem = file.replace(/\.[^.]+$/, "");
+  const base = `audio/${ring}/${stem}`;
+  if (!availableAudioStems.has(base)) {
+    return [];
+  }
+
+  return [
+    { src: `${base}.webm`, type: "audio/webm; codecs=\"opus\"" },
+    { src: `${base}.ogg`, type: "audio/ogg; codecs=\"vorbis\"" },
+    { src: `${base}.m4a`, type: "audio/mp4; codecs=\"mp4a.40.2\"" },
+    { src: `${base}.mp3`, type: "audio/mpeg" }
+  ];
+}
 
 export function regionIndex(ring, wedgeIndex) {
   const normalized = ((wedgeIndex % WEDGE_COUNT) + WEDGE_COUNT) % WEDGE_COUNT;

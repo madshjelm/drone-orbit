@@ -1,23 +1,39 @@
-const MASTER_RAMP_SECONDS = 0.05;
-const REGION_RAMP_SECONDS = 0.08;
+import { getRuntimeProfile } from "./device.js";
 
-// Mobile-friendly mix scheduling.
-const MIX_THROTTLE_MS = 50; // ~20 Hz instead of per animation frame
-const MIX_GATE = 0.001; // skip gain ramps smaller than this
+const MASTER_RAMP_SECONDS = 0.05;
+
+const DEFAULT_TIMING = {
+  mixThrottleMs: 50,
+  mixGate: 0.001,
+  regionRampSeconds: 0.1,
+  voiceGraceSeconds: 8
+};
+
+const CONSTRAINED_TIMING = {
+  mixThrottleMs: 90,
+  mixGate: 0.004,
+  regionRampSeconds: 0.18,
+  voiceGraceSeconds: 22
+};
 
 // Dynamic-voice thresholds (only audible regions get a live source).
 const VOICE_ON = 0.012;
 const VOICE_OFF = 0.0025;
-const VOICE_FADE_SECONDS = 0.35;
 
 export class DroneAudioEngine {
   constructor(regions, zoneState) {
     this.regions = regions;
     this.zoneState = zoneState;
+    this.profile = getRuntimeProfile();
+    const timing = this.profile.constrained ? CONSTRAINED_TIMING : DEFAULT_TIMING;
     this.context = null;
     this.regionGains = [];
     this.voices = regions.map(() => ({ source: null, stopAt: 0 }));
     this.buffers = [];
+    this.selectedSources = regions.map(() => null);
+    this.fetchFailures = [];
+    this.decodeFailures = [];
+    this.trimmedBuffers = [];
     this.master = null;
     this.eq = {};
     this.started = false;
@@ -29,7 +45,12 @@ export class DroneAudioEngine {
     this.streamDest = null;
     this.mediaEl = null;
     this.usingStreamSink = false;
+    this.outputMode = "none";
     this._fadeTimer = null;
+    this.mixThrottleMs = timing.mixThrottleMs;
+    this.mixGate = timing.mixGate;
+    this.regionRampSeconds = timing.regionRampSeconds;
+    this.voiceGraceSeconds = timing.voiceGraceSeconds;
   }
 
   // Fetch + decode every buffer ahead of time, without a user gesture. The
@@ -54,8 +75,14 @@ export class DroneAudioEngine {
     this.ready = (async () => {
       const pending = this.regions.map((region) => this.fetchAudio(region));
       for (let index = 0; index < this.regions.length; index += 1) {
-        const data = await pending[index];
-        this.buffers[index] = await this.decodeBuffer(data);
+        const audioFile = await pending[index];
+        this.buffers[index] = await this.decodeBuffer(audioFile, index);
+        if (this.buffers[index] && audioFile) {
+          this.selectedSources[index] = {
+            src: audioFile.src,
+            type: audioFile.type
+          };
+        }
         this._loaded += 1;
         onProgress(this._loaded, this.regions.length);
         await yieldToMainThread();
@@ -98,10 +125,14 @@ export class DroneAudioEngine {
     }
   }
 
-  // Route master through a MediaStream + hidden <audio> element so mobile
-  // browsers surface OS media controls and keep playing in the background. Falls
-  // back to the direct destination if that path is unavailable (e.g. iOS quirks).
+  // Android Chrome and iframes get the shortest audio path. The MediaStream sink
+  // remains available for non-Android foreground/background media controls.
   async setupOutputSink() {
+    if (this.profile.android || this.profile.embedded || this.profile.constrained) {
+      this.connectDirectOutput();
+      return;
+    }
+
     const ctx = this.context;
     try {
       if (typeof ctx.createMediaStreamDestination !== "function") {
@@ -117,17 +148,39 @@ export class DroneAudioEngine {
       this.mediaEl.loop = true;
       await this.mediaEl.play();
       this.usingStreamSink = true;
+      this.outputMode = "stream";
     } catch (error) {
-      this.usingStreamSink = false;
-      if (this.streamDest) {
-        try {
-          this.master.disconnect(this.streamDest);
-        } catch (disconnectError) {
-          /* ignore */
-        }
-        this.streamDest = null;
+      this.connectDirectOutput();
+    }
+  }
+
+  connectDirectOutput() {
+    if (!this.context || !this.master) {
+      return;
+    }
+
+    this.usingStreamSink = false;
+    this.outputMode = "direct";
+    if (this.streamDest) {
+      try {
+        this.master.disconnect(this.streamDest);
+      } catch (error) {
+        /* ignore */
       }
-      this.master.connect(ctx.destination);
+      this.streamDest = null;
+    }
+    if (this.mediaEl) {
+      try {
+        this.mediaEl.pause();
+        this.mediaEl.srcObject = null;
+      } catch (error) {
+        /* ignore */
+      }
+    }
+    try {
+      this.master.connect(this.context.destination);
+    } catch (error) {
+      /* already connected */
     }
   }
 
@@ -157,7 +210,7 @@ export class DroneAudioEngine {
     if (this.context && this.context.state === "running") {
       await this.context.suspend().catch(() => undefined);
     }
-    if (this.mediaEl) {
+    if (this.usingStreamSink && this.mediaEl) {
       try {
         this.mediaEl.pause();
       } catch (error) {
@@ -238,7 +291,7 @@ export class DroneAudioEngine {
     }
 
     const wall = typeof performance !== "undefined" ? performance.now() : Date.now();
-    if (wall - this._lastMixAt < MIX_THROTTLE_MS) {
+    if (wall - this._lastMixAt < this.mixThrottleMs) {
       return;
     }
     this._lastMixAt = wall;
@@ -264,16 +317,16 @@ export class DroneAudioEngine {
         target = gain;
       } else if (gain < VOICE_OFF) {
         if (voice.source && !voice.stopAt) {
-          voice.stopAt = now + VOICE_FADE_SECONDS;
+          voice.stopAt = now + this.voiceGraceSeconds;
         }
         target = 0;
       } else {
         target = voice.source ? (voice.stopAt ? 0 : gain) : 0;
       }
 
-      if (Math.abs(target - this._lastTargets[index]) >= MIX_GATE) {
+      if (Math.abs(target - this._lastTargets[index]) >= this.mixGate) {
         this._lastTargets[index] = target;
-        this.regionGains[index].gain.setTargetAtTime(target, now, REGION_RAMP_SECONDS);
+        this.regionGains[index].gain.setTargetAtTime(target, now, this.regionRampSeconds);
       }
 
       if (voice.source && voice.stopAt && now >= voice.stopAt) {
@@ -315,26 +368,115 @@ export class DroneAudioEngine {
   }
 
   async fetchAudio(region) {
-    try {
-      const response = await fetch(region.audioPath);
-      if (!response.ok) {
-        return null;
+    const sources = supportedSources(region);
+    for (const source of sources) {
+      try {
+        const response = await fetch(source.src);
+        if (!response.ok) {
+          this.recordFetchFailure(region, source, `HTTP ${response.status}`);
+          continue;
+        }
+        return {
+          data: await response.arrayBuffer(),
+          src: source.src,
+          type: source.type || ""
+        };
+      } catch (error) {
+        this.recordFetchFailure(region, source, error.message || "Fetch failed");
       }
-      return await response.arrayBuffer();
+    }
+    return null;
+  }
+
+  async decodeBuffer(audioFile, index) {
+    if (!audioFile) {
+      return null;
+    }
+    try {
+      const buffer = await this.context.decodeAudioData(audioFile.data);
+      return this.trimLoopPadding(buffer, index, audioFile);
     } catch (error) {
+      this.decodeFailures.push({
+        region: this.regions[index]?.label || `Region ${index}`,
+        src: audioFile.src,
+        message: error.message || "Decode failed"
+      });
       return null;
     }
   }
 
-  async decodeBuffer(data) {
-    if (!data) {
-      return null;
+  trimLoopPadding(buffer, index, audioFile) {
+    const duration = this.regions[index]?.loopDuration;
+    if (!duration || buffer.duration <= duration + 0.005) {
+      return buffer;
     }
-    try {
-      return await this.context.decodeAudioData(data);
-    } catch (error) {
-      return null;
+
+    const length = Math.min(buffer.length, Math.round(duration * buffer.sampleRate));
+    const trimmed = this.context.createBuffer(buffer.numberOfChannels, length, buffer.sampleRate);
+    for (let channel = 0; channel < buffer.numberOfChannels; channel += 1) {
+      trimmed.copyToChannel(buffer.getChannelData(channel).subarray(0, length), channel);
     }
+    this.trimmedBuffers.push({
+      region: this.regions[index].label,
+      src: audioFile.src,
+      from: Number(buffer.duration.toFixed(3)),
+      to: Number(trimmed.duration.toFixed(3))
+    });
+    return trimmed;
+  }
+
+  recordFetchFailure(region, source, message) {
+    this.fetchFailures.push({
+      region: region.label,
+      src: source.src,
+      message
+    });
+    if (this.fetchFailures.length > 48) {
+      this.fetchFailures.shift();
+    }
+  }
+
+  getDiagnostics() {
+    return {
+      profile: this.profile,
+      contextState: this.context ? this.context.state : "none",
+      sampleRate: this.context ? this.context.sampleRate : null,
+      baseLatency: this.context?.baseLatency ?? null,
+      outputMode: this.outputMode,
+      activeVoices: this.voices.filter((voice) => voice.source).length,
+      stoppingVoices: this.voices.filter((voice) => voice.source && voice.stopAt).length,
+      loaded: this._loaded,
+      total: this.regions.length,
+      selectedSources: this.selectedSources
+        .map((source, index) => source && {
+          region: this.regions[index].label,
+          ...source
+        })
+        .filter(Boolean),
+      fetchFailures: this.fetchFailures.slice(-12),
+      decodeFailures: this.decodeFailures.slice(-12),
+      trimmedBuffers: this.trimmedBuffers.slice(-12)
+    };
+  }
+}
+
+let audioSupportProbe = null;
+
+function supportedSources(region) {
+  const sources = region.audioSources || (region.audioPath ? [{ src: region.audioPath, type: "" }] : []);
+  const supported = sources.filter((source) => canPlayAudioType(source.type));
+  return supported.length ? supported : sources;
+}
+
+function canPlayAudioType(type) {
+  if (!type) {
+    return true;
+  }
+  try {
+    audioSupportProbe ||= new Audio();
+    return audioSupportProbe.canPlayType(type) !== "";
+  } catch (error) {
+    return true;
   }
 }
 
