@@ -1,6 +1,7 @@
 import { TAU, WEDGE_ANGLE, WEDGE_COUNT, geometry, normalizeAngle, regionFor, regions } from "./config.js";
 
 const reducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+const liteMode = detectLiteMode();
 
 // Equirectangular Earth texture resolution. Generated once at startup; this is
 // plenty for the small on-screen sphere.
@@ -45,6 +46,7 @@ export class OrbitRenderer {
     this.planetImage = null;
     this.planetPx = 0;
     this.lastPlanetRender = -1;
+    this.planetFrozen = false;
 
     this.twinkles = [];
     this.meteor = null;
@@ -218,7 +220,8 @@ export class OrbitRenderer {
 
   buildPlanetBuffer() {
     const planetR = this.radius * geometry.planetRadiusRatio;
-    const px = Math.max(32, Math.min(PLANET_MAX_PX, Math.round(planetR * 2 * this.dpr)));
+    const cap = liteMode ? 150 : PLANET_MAX_PX;
+    const px = Math.max(32, Math.min(cap, Math.round(planetR * 2 * this.dpr)));
     if (px === this.planetPx && this.planetImage) {
       return;
     }
@@ -227,6 +230,7 @@ export class OrbitRenderer {
     this.planetCanvas.height = px;
     this.planetImage = this.planetCtx.createImageData(px, px);
     this.lastPlanetRender = -1;
+    this.planetFrozen = false;
   }
 
   setZoom(value, markUser = true) {
@@ -560,22 +564,25 @@ export class OrbitRenderer {
     if (!this.planetImage) {
       return;
     }
-    // The per-pixel pass is the heaviest work here, so cap it to ~30Hz. The
-    // sphere rotates slowly enough that this is imperceptible, and reduced
-    // motion renders it exactly once.
-    if (reducedMotion) {
-      if (this.lastPlanetRender >= 0) {
+    // Hold the globe still until launch (and for reduced motion) so the intro
+    // costs almost nothing while audio preloads. Once flying, rotate but cap the
+    // per-pixel pass to ~20-30 Hz since the sphere turns slowly.
+    const frozen = reducedMotion || this.state.phase === "entry";
+    if (frozen) {
+      if (this.planetFrozen) {
         return;
       }
-      this.lastPlanetRender = time;
+      this.planetFrozen = true;
     } else {
-      if (this.lastPlanetRender >= 0 && time - this.lastPlanetRender < 33) {
+      this.planetFrozen = false;
+      const rate = liteMode ? 50 : 33;
+      if (this.lastPlanetRender >= 0 && time - this.lastPlanetRender < rate) {
         return;
       }
       this.lastPlanetRender = time;
     }
 
-    const spin = reducedMotion ? 0.7 : time * 0.00006;
+    const spin = frozen ? 0.6 : time * 0.00006;
     const px = this.planetPx;
     const data = this.planetImage.data;
     const earth = this.earthTex;
@@ -1072,6 +1079,19 @@ function mulberry32(seed) {
 function normalize3(x, y, z) {
   const l = Math.hypot(x, y, z) || 1;
   return [x / l, y / l, z / l];
+}
+
+// Phones / low-power devices get a lighter planet render (matches the audio
+// engine's own detection so both ease off together).
+function detectLiteMode() {
+  try {
+    const coarse = typeof window.matchMedia === "function" && window.matchMedia("(pointer: coarse)").matches;
+    const lowCores = (navigator.hardwareConcurrency || 8) <= 4;
+    const mobileUA = /Android|iPhone|iPad|iPod|Mobile/i.test(navigator.userAgent || "");
+    return Boolean((coarse && lowCores) || mobileUA);
+  } catch (error) {
+    return false;
+  }
 }
 
 function polar(angle, radius) {

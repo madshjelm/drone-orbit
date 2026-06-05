@@ -79,8 +79,18 @@ let lastFrame = performance.now();
 
 wireControls();
 requestAnimationFrame(tick);
-// Start fetching + decoding the soundscape immediately so Launch is instant.
-audio.preload(state.settings).catch(() => {});
+// Preload the soundscape during idle time, after the entry screen has painted,
+// so decoding/synthesis never janks the intro. Launch still forces it if needed.
+schedulePreload();
+
+function schedulePreload() {
+  const run = () => audio.preload(state.settings).catch(() => {});
+  if (typeof window.requestIdleCallback === "function") {
+    window.requestIdleCallback(run, { timeout: 2000 });
+  } else {
+    window.setTimeout(run, 400);
+  }
+}
 
 function wireControls() {
   loadPersistedSettings();
